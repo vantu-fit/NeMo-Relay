@@ -10,7 +10,10 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::llm::LlmRequest;
-use crate::api::runtime::{LlmExecutionFn, LlmJsonStream, LlmStreamExecutionFn, ToolExecutionFn};
+use crate::api::runtime::{
+    LlmExecutionFn, LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionFn,
+    LlmStreamExecutionNextFn, ToolExecutionFn,
+};
 use crate::api::scope::{EmitMarkEventParams, ScopeHandle, event, get_handle};
 use crate::codec::openai_chat::OpenAIChatCodec;
 use crate::codec::streaming::SseEventDecoder;
@@ -111,6 +114,60 @@ impl RemoteBackendRuntime {
             ),
             access_state: Arc::new(AtomicU8::new(0)),
         })
+    }
+
+    async fn intercept_llm(
+        &self,
+        request: LlmRequest,
+        next: LlmExecutionNextFn,
+    ) -> crate::error::Result<Json> {
+        if request_uses_openai_tools(&request)? {
+            self.check_llm_input(&request).await?;
+            return next(request).await;
+        }
+        self.execute(request, false).await
+    }
+
+    async fn intercept_llm_stream(
+        &self,
+        request: LlmRequest,
+        next: LlmStreamExecutionNextFn,
+    ) -> crate::error::Result<LlmJsonStream> {
+        if request_uses_openai_tools(&request)? {
+            self.check_llm_input(&request).await?;
+            return next(request).await;
+        }
+        self.execute_stream(request).await
+    }
+
+    async fn check_llm_input(&self, request: &LlmRequest) -> crate::error::Result<()> {
+        let parent = get_handle().ok();
+        self.emit_remote_start(&parent, false);
+        let body = self.llm_check_request_body_with_marks(&parent, request)?;
+        let response = self
+            .send_remote_request_with_marks(&parent, false, body)
+            .await?;
+        let status = response.status();
+        let response_json = self
+            .read_json_response_with_marks(&parent, false, response)
+            .await?;
+        self.emit_mark(
+            "nemo_guardrails.remote.end",
+            &parent,
+            remote_mark_data(
+                false,
+                &self.config_id,
+                &self.config_ids,
+                Some(status.as_u16()),
+                None,
+            ),
+        );
+        if let Some(blocking_rail) = blocking_rail_name(&response_json) {
+            return Err(FlowError::GuardrailRejected(format!(
+                "nemo_guardrails input rail blocked LLM request by rail '{blocking_rail}'"
+            )));
+        }
+        Ok(())
     }
 
     async fn execute(&self, request: LlmRequest, stream: bool) -> crate::error::Result<Json> {
@@ -221,6 +278,16 @@ impl RemoteBackendRuntime {
     ) -> crate::error::Result<Json> {
         self.build_request_body(request, stream).inspect_err(|err| {
             self.emit_remote_error(parent, stream, None, err.to_string());
+        })
+    }
+
+    fn llm_check_request_body_with_marks(
+        &self,
+        parent: &Option<ScopeHandle>,
+        request: &LlmRequest,
+    ) -> crate::error::Result<Json> {
+        self.llm_check_request_body(request).inspect_err(|err| {
+            self.emit_remote_error(parent, false, None, err.to_string());
         })
     }
 
@@ -490,18 +557,42 @@ impl RemoteBackendRuntime {
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> crate::error::Result<Json> {
-        let annotated = OpenAIChatCodec.decode(request)?;
-        if annotated.tools.is_some() || annotated.tool_choice.is_some() {
-            return Err(FlowError::Internal(
-                "nemo_guardrails remote backend does not support OpenAI tool definitions or tool_choice yet"
-                    .to_string(),
-            ));
-        }
-
+        let _annotated = OpenAIChatCodec.decode(request)?;
         let mut body = request.content.as_object().cloned().ok_or_else(|| {
             FlowError::Internal("LLM request content is not a JSON object".to_string())
         })?;
+        // Tool-bearing LLM requests use check-then-`next()` instead of this
+        // Guardrails-as-LLM proxy. Strip leftover tool fields so a defensive
+        // proxy call cannot send an unsupported stock-remote contract.
+        body.remove("tools");
+        body.remove("tool_choice");
         body.insert("stream".to_string(), Json::Bool(stream));
+        if let Some(guardrails) = &self.llm_guardrails {
+            body.insert("guardrails".to_string(), Json::Object(guardrails.clone()));
+        }
+        Ok(Json::Object(body))
+    }
+
+    fn llm_check_request_body(&self, request: &LlmRequest) -> crate::error::Result<Json> {
+        let _annotated = OpenAIChatCodec.decode(request)?;
+        let object = request.content.as_object().ok_or_else(|| {
+            FlowError::Internal("LLM request content is not a JSON object".to_string())
+        })?;
+        let messages = object.get("messages").cloned().ok_or_else(|| {
+            FlowError::Internal(
+                "nemo_guardrails remote LLM check requires OpenAI chat messages".to_string(),
+            )
+        })?;
+        let mut body = Map::new();
+        body.insert(
+            "model".to_string(),
+            object
+                .get("model")
+                .cloned()
+                .unwrap_or_else(|| Json::String(String::new())),
+        );
+        body.insert("messages".to_string(), messages);
+        body.insert("stream".to_string(), Json::Bool(false));
         if let Some(guardrails) = &self.llm_guardrails {
             body.insert("guardrails".to_string(), Json::Object(guardrails.clone()));
         }
@@ -656,6 +747,11 @@ impl RemoteBackendRuntime {
         );
         Ok(response_json)
     }
+}
+
+fn request_uses_openai_tools(request: &LlmRequest) -> crate::error::Result<bool> {
+    let annotated = OpenAIChatCodec.decode(request)?;
+    Ok(annotated.tools.is_some() || annotated.tool_choice.is_some())
 }
 
 fn emit_remote_mark(name: &str, parent: &Option<ScopeHandle>, data: Json) {
@@ -979,16 +1075,16 @@ pub(super) fn register_remote_backend(
 
     if config.input || config.output {
         let llm_execution_runtime = Arc::clone(&runtime);
-        let llm_execution: LlmExecutionFn = Arc::new(move |_name, request, _next| {
+        let llm_execution: LlmExecutionFn = Arc::new(move |_name, request, next| {
             let runtime = Arc::clone(&llm_execution_runtime);
-            Box::pin(async move { runtime.execute(request, false).await })
+            Box::pin(async move { runtime.intercept_llm(request, next).await })
         });
         ctx.register_llm_execution_intercept("llm_remote_backend", config.priority, llm_execution)?;
 
         let llm_stream_runtime = Arc::clone(&runtime);
-        let llm_stream_execution: LlmStreamExecutionFn = Arc::new(move |_name, request, _next| {
+        let llm_stream_execution: LlmStreamExecutionFn = Arc::new(move |_name, request, next| {
             let runtime = Arc::clone(&llm_stream_runtime);
-            Box::pin(async move { runtime.execute_stream(request).await })
+            Box::pin(async move { runtime.intercept_llm_stream(request, next).await })
         });
         ctx.register_llm_stream_execution_intercept(
             "llm_stream_remote_backend",

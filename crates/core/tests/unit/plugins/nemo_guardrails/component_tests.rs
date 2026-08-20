@@ -199,6 +199,27 @@ fn make_chat_request(stream: bool) -> LlmRequest {
     }
 }
 
+fn make_tool_chat_request(stream: bool) -> LlmRequest {
+    LlmRequest {
+        headers: serde_json::Map::new(),
+        content: json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.2,
+            "stream": stream,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Lookup data",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": "auto"
+        }),
+    }
+}
+
 fn capture_events(name: &str) -> Arc<Mutex<Vec<Event>>> {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);

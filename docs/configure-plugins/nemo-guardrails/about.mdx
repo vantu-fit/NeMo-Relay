@@ -52,7 +52,9 @@ Both modes support managed LLM `input` and `output`. The current mode-specific
 differences are:
 
 - `remote` supports `request_defaults` pass-through but does not support managed
-  `tool_input`
+  `tool_input`. Remote LLM requests that include OpenAI `tools` or `tool_choice`
+  run an input check, then continue to the real provider instead of treating
+  Guardrails as the LLM.
 - `local` supports managed `tool_input` and broader LLM codec coverage, but it
   does not support `request_defaults`
 

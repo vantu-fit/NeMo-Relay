@@ -223,20 +223,21 @@ fn request_body_and_guardrails_config_helpers_cover_defaults() {
         runtime.build_request_body(&invalid_request, false),
         "request content is not an object",
     );
-    assert_flow_error_contains(
-        runtime.build_request_body(
+    let stripped = runtime
+        .build_request_body(
             &LlmRequest {
                 headers: Map::new(),
                 content: json!({
                     "model": "gpt-4o-mini",
-                    "messages": [],
+                    "messages": [{"role": "user", "content": "hello"}],
                     "tools": [{"type": "function", "function": {"name": "lookup"}}]
                 }),
             },
             false,
-        ),
-        "does not support OpenAI tool definitions",
-    );
+        )
+        .expect("tool-bearing proxy body should strip tools instead of failing");
+    assert!(stripped.get("tools").is_none());
+    assert!(stripped.get("tool_choice").is_none());
     runtime.record_access_status(reqwest::StatusCode::OK);
     assert_eq!(runtime.access_state.load(Ordering::Acquire), 2);
     runtime.record_access_status(reqwest::StatusCode::OK);
@@ -379,7 +380,7 @@ fn named_rail_selector_combinations_are_preserved_for_llm_and_tool_checks() {
 }
 
 #[test]
-fn request_body_rejects_tool_definitions_and_sets_stream_flag() {
+fn request_body_strips_tool_definitions_and_sets_stream_flag() {
     let runtime = valid_runtime();
     let with_tools = LlmRequest {
         headers: Map::new(),
@@ -392,10 +393,11 @@ fn request_body_rejects_tool_definitions_and_sets_stream_flag() {
             }],
         }),
     };
-    assert_flow_error_contains(
-        runtime.build_request_body(&with_tools, false),
-        "does not support OpenAI tool definitions",
-    );
+    let tools_body = runtime
+        .build_request_body(&with_tools, false)
+        .expect("tool definitions should be stripped from the Guardrails-as-LLM body");
+    assert!(tools_body.get("tools").is_none());
+    assert_eq!(tools_body["messages"][0]["content"], json!("hello"));
 
     let with_tool_choice = LlmRequest {
         headers: Map::new(),
@@ -405,10 +407,18 @@ fn request_body_rejects_tool_definitions_and_sets_stream_flag() {
             "tool_choice": "auto",
         }),
     };
-    assert_flow_error_contains(
-        runtime.build_request_body(&with_tool_choice, false),
-        "does not support OpenAI tool definitions",
-    );
+    let choice_body = runtime
+        .build_request_body(&with_tool_choice, false)
+        .expect("tool_choice should be stripped from the Guardrails-as-LLM body");
+    assert!(choice_body.get("tool_choice").is_none());
+
+    let check_body = runtime
+        .llm_check_request_body(&with_tools)
+        .expect("LLM check body");
+    assert!(check_body.get("tools").is_none());
+    assert!(check_body.get("tool_choice").is_none());
+    assert_eq!(check_body["stream"], json!(false));
+    assert_eq!(check_body["messages"][0]["content"], json!("hello"));
 
     let body = runtime
         .build_request_body(&simple_chat_request(), true)
