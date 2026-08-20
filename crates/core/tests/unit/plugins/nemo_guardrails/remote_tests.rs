@@ -820,47 +820,176 @@ async fn remote_streaming_malformed_chunk_is_reported_and_marked() {
 }
 
 #[tokio::test]
-async fn remote_preflight_tool_choice_failure_is_reported_and_marked() {
+async fn remote_tool_bearing_llm_request_checks_then_forwards_to_next() {
     let _guard = crate::plugins::nemo_guardrails::test_mutex()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     reset_runtime();
     setup_isolated_thread();
-    let events = capture_events("nemo-guardrails-remote-preflight-error-events");
+    let events = capture_events("nemo-guardrails-remote-tools-passthrough-events");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let response_body = json!({
+        "id": "chatcmpl-check",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "allowed"},
+            "finish_reason": "stop"
+        }],
+        "guardrails": {
+            "config_id": "safety-default",
+            "log": {"activated_rails": []}
+        }
+    })
+    .to_string();
+    let http_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    )
+    .into_bytes();
+    spawn_http_responder(listener, http_response, request_tx);
 
     initialize_plugins(plugin_config(json!({
         "mode": "remote",
         "codec": "openai_chat",
         "remote": {
-            "endpoint": unused_local_endpoint(),
+            "endpoint": format!("http://{address}"),
             "config_id": "safety-default"
         }
     })))
     .await
     .unwrap();
 
-    let func: LlmExecutionNextFn =
-        Arc::new(move |_req| Box::pin(async move { Ok(json!({"response": "original"})) }));
-    let request = LlmRequest {
-        headers: serde_json::Map::new(),
-        content: json!({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": "hello"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "lookup",
-                    "description": "Lookup data",
-                    "parameters": {"type": "object"}
-                }
-            }]
-        }),
-    };
+    let forwarded = Arc::new(Mutex::new(None));
+    let forwarded_slot = Arc::clone(&forwarded);
+    let func: LlmExecutionNextFn = Arc::new(move |req| {
+        *forwarded_slot.lock().unwrap() = Some(req.content.clone());
+        Box::pin(async move {
+            Ok(json!({
+                "id": "chatcmpl-provider",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "from-provider"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+    });
+
+    let response = llm_call_execute(
+        LlmCallExecuteParams::builder()
+            .name("openai")
+            .request(make_tool_chat_request(false))
+            .func(func)
+            .attributes(LlmAttributes::empty())
+            .response_codec(Arc::new(OpenAIChatCodec) as Arc<dyn LlmResponseCodec>)
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        json!("from-provider")
+    );
+
+    let forwarded_request = forwarded.lock().unwrap().clone().unwrap();
+    assert_eq!(forwarded_request["tools"][0]["function"]["name"], json!("lookup"));
+    assert_eq!(forwarded_request["tool_choice"], json!("auto"));
+
+    let captured = recv_captured_request(&request_rx);
+    let request_json: Json = serde_json::from_slice(&captured.body).unwrap();
+    assert_eq!(request_json["messages"][0]["content"], json!("hello"));
+    assert!(request_json.get("tools").is_none());
+    assert!(request_json.get("tool_choice").is_none());
+    assert_eq!(request_json["stream"], json!(false));
+
+    let captured_events = captured_events_snapshot(&events);
+    assert!(
+        captured_events
+            .iter()
+            .any(|event| event.name() == "nemo_guardrails.remote.start")
+    );
+    assert!(
+        captured_events
+            .iter()
+            .any(|event| event.name() == "nemo_guardrails.remote.end")
+    );
+
+    deregister_subscriber("nemo-guardrails-remote-tools-passthrough-events").unwrap();
+}
+
+#[tokio::test]
+async fn remote_tool_bearing_llm_request_is_blocked_before_next() {
+    let _guard = crate::plugins::nemo_guardrails::test_mutex()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    reset_runtime();
+    setup_isolated_thread();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_tx, _request_rx) = mpsc::channel();
+    let response_body = json!({
+        "id": "chatcmpl-check-block",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "blocked"},
+            "finish_reason": "stop"
+        }],
+        "guardrails": {
+            "config_id": "safety-default",
+            "log": {
+                "activated_rails": [{
+                    "name": "self check input",
+                    "stop": true
+                }]
+            }
+        }
+    })
+    .to_string();
+    let http_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    )
+    .into_bytes();
+    spawn_http_responder(listener, http_response, request_tx);
+
+    initialize_plugins(plugin_config(json!({
+        "mode": "remote",
+        "codec": "openai_chat",
+        "remote": {
+            "endpoint": format!("http://{address}"),
+            "config_id": "safety-default"
+        }
+    })))
+    .await
+    .unwrap();
+
+    let original_called = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&original_called);
+    let func: LlmExecutionNextFn = Arc::new(move |_req| {
+        called.store(true, Ordering::SeqCst);
+        Box::pin(async move { Ok(json!({"response": "original"})) })
+    });
 
     let error = llm_call_execute(
         LlmCallExecuteParams::builder()
             .name("openai")
-            .request(request)
+            .request(make_tool_chat_request(false))
             .func(func)
             .attributes(LlmAttributes::empty())
             .response_codec(Arc::new(OpenAIChatCodec) as Arc<dyn LlmResponseCodec>)
@@ -869,32 +998,13 @@ async fn remote_preflight_tool_choice_failure_is_reported_and_marked() {
     .await
     .unwrap_err();
 
+    assert!(!original_called.load(Ordering::SeqCst));
     match error {
-        crate::error::FlowError::Internal(message) => {
-            assert!(message.contains("does not support OpenAI tool definitions or tool_choice"));
+        crate::error::FlowError::GuardrailRejected(message) => {
+            assert!(message.contains("self check input"));
         }
         other => panic!("unexpected error: {other}"),
     }
-
-    let captured_events = captured_events_snapshot(&events);
-    assert!(
-        captured_events
-            .iter()
-            .any(|event| event.name() == "nemo_guardrails.remote.start")
-    );
-    let error_mark = captured_events
-        .iter()
-        .find(|event| event.name() == "nemo_guardrails.remote.error")
-        .unwrap();
-    assert_eq!(error_mark.data().unwrap()["stream"], json!(false));
-    assert!(
-        error_mark.data().unwrap()["error"]
-            .as_str()
-            .unwrap()
-            .contains("does not support OpenAI tool definitions or tool_choice")
-    );
-
-    deregister_subscriber("nemo-guardrails-remote-preflight-error-events").unwrap();
 }
 
 #[tokio::test]

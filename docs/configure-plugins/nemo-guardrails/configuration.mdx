@@ -63,6 +63,7 @@ The following table compares remote and local backend support:
 | Managed LLM `input` | Supported | Supported |
 | Managed LLM `output` | Supported | Supported |
 | Managed streaming LLM execution | Supported over the remote HTTP(S) contract | Supported; refer to [Streaming Boundary](#streaming-boundary) |
+| OpenAI `tools` / `tool_choice` on managed LLM requests | Input-check then provider `_next` | Supported |
 | Managed `tool_input` | Not supported against the stock Guardrails remote contract | Supported |
 | Managed `tool_output` | Supported | Supported |
 | `request_defaults` pass-through | Supported | Not supported |
@@ -160,6 +161,15 @@ When `mode = "remote"`:
 The current built-in remote mode supports managed LLM execution only with:
 
 - `openai_chat`
+
+Tool-bearing OpenAI Chat Completions requests (`tools` and/or `tool_choice`)
+are not sent to the Guardrails service as the LLM. Remote mode runs a messages-only
+input check against the stock Guardrails HTTP(S) contract, then forwards the
+original request — including tool definitions — through `_next` to the real
+provider. Tool-free requests keep the existing Guardrails-as-LLM proxy.
+
+Streaming tool-bearing requests follow the same input-check-then-`_next` path.
+Remote output wrapping of that provider stream is out of scope for this path.
 
 ### Managed Tool Boundary
 
