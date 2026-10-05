@@ -8,6 +8,71 @@ use serde_json::Map;
 use super::*;
 use crate::events::LlmHintEvent;
 
+#[test]
+fn codex_gateway_turn_input_uses_latest_user_text_only() {
+    let request = LlmRequest {
+        headers: Map::from_iter([("Authorization".into(), json!("secret-header"))]),
+        content: json!({
+            "instructions": "private instructions",
+            "input": [
+                {"role": "user", "content": "old prompt"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "inspect disk"},
+                    {"type": "input_image", "image_url": "private-image"},
+                    {"type": "input_text", "text": "and summarize"}
+                ]},
+                {"type": "function_call_output", "output": "private tool result"}
+            ]
+        }),
+    };
+    assert_eq!(
+        gateway_turn_input(AgentKind::Codex, "openai.responses", &request),
+        Some(json!({"prompt": "inspect disk\nand summarize"}))
+    );
+    assert_eq!(
+        gateway_turn_input(AgentKind::ClaudeCode, "openai.responses", &request),
+        None
+    );
+    assert_eq!(
+        gateway_turn_input(AgentKind::Codex, "openai.chat.completions", &request),
+        None
+    );
+}
+
+#[test]
+fn codex_gateway_turn_input_preserves_json_and_rejects_missing_user_text() {
+    for content in [
+        json!({"input": "{\"task\":\"test\"}"}),
+        json!({"input": [{"role":"user", "content":"{\"task\":\"test\"}"}]}),
+    ] {
+        let request = LlmRequest {
+            headers: Map::new(),
+            content,
+        };
+        assert_eq!(
+            gateway_turn_input(AgentKind::Codex, "openai.responses", &request),
+            Some(json!({"prompt":"{\"task\":\"test\"}"}))
+        );
+    }
+    for content in [
+        json!({"input":"   "}),
+        json!({"input":[]}),
+        json!({"input":[{"type":"function_call_output", "output":"not a prompt"}]}),
+        json!({"input":[{"role":"user", "content":"old prompt"},
+                       {"role":"user", "content":[{"type":"input_image", "image_url":"private-image"}]}]}),
+    ] {
+        let request = LlmRequest {
+            headers: Map::new(),
+            content,
+        };
+        assert_eq!(
+            gateway_turn_input(AgentKind::Codex, "openai.responses", &request),
+            None
+        );
+    }
+}
+
 fn session_event(session_id: &str, event_name: &str) -> SessionEvent {
     SessionEvent {
         session_id: session_id.into(),

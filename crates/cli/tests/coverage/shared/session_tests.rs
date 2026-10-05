@@ -2688,6 +2688,74 @@ async fn claude_startup_probe_only_session_is_pruned_after_finish() {
 }
 
 #[tokio::test]
+async fn codex_direct_gateway_request_seeds_turn_input() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let otel_name = "cli-codex-direct-input-openinference-test";
+    let (subscriber, exporter) = make_openinference_test_subscriber("codex-direct-input");
+    subscriber.register(otel_name).unwrap();
+    let subscriber_name = "cli-codex-direct-gateway-turn-input-test";
+    let _ = deregister_subscriber(subscriber_name);
+    let captured_events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let captured = captured_events.clone();
+    register_subscriber(
+        subscriber_name,
+        Arc::new(move |event| {
+            if event
+                .metadata()
+                .and_then(|m| m.get("session_id"))
+                .and_then(Value::as_str)
+                == Some("codex-direct-input")
+                && event.scope_category() == Some(ScopeCategory::Start)
+                && event.name() == "codex-turn"
+            {
+                captured.lock().unwrap().push(json!({
+                    "input": event.input().cloned().unwrap_or(Value::Null),
+                    "metadata": event.metadata().cloned().unwrap_or(Value::Null)
+                }));
+            }
+        }),
+    )
+    .unwrap();
+    let manager = SessionManager::new(session_test_config());
+    let prep = manager.prepare_gateway_call(
+        &HeaderMap::new(),
+        LlmGatewayStart {
+            session_id: Some("codex-direct-input".into()),
+            request: LlmRequest {
+                headers: Map::new(),
+                content: json!({"model": "gpt-test", "input": [
+                    {"role": "user", "content": "old prompt"},
+                    {"role": "assistant", "content": "old reply"},
+                    {"role": "user", "content": [{"type": "input_text", "text": "inspect Codex input"}]}
+                ]}),
+            },
+            ..llm_start()
+        },
+    ).await.unwrap();
+    assert!(!prep.bypass_managed_pipeline);
+    manager
+        .finish_gateway_call(&prep.session_id, prep.session_finish)
+        .await;
+    flush_subscribers().unwrap();
+    let events = captured_events.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "{events:#?}");
+    assert_eq!(events[0]["input"], json!({"prompt": "inspect Codex input"}));
+    assert_eq!(
+        events[0]["metadata"]["turn_source"],
+        json!("gateway_request")
+    );
+    deregister_subscriber(subscriber_name).unwrap();
+    stop_codex_turn(&manager, &HeaderMap::new(), "codex-direct-input").await;
+    subscriber.force_flush().unwrap();
+    assert!(subscriber.deregister(otel_name).unwrap());
+    let spans = exporter.get_finished_spans().unwrap();
+    let turn = spans.iter().find(|span| span.name == "codex-turn").unwrap();
+    let attrs = attr_map(&turn.attributes);
+    let exported_input: Value = serde_json::from_str(attrs.get("input.value").unwrap()).unwrap();
+    assert_eq!(exported_input, json!({"prompt": "inspect Codex input"}));
+}
+
+#[tokio::test]
 async fn claude_direct_gateway_request_seeds_turn_input_before_prompt_hook() {
     let subscriber_name = "cli-claude-direct-gateway-turn-input-test";
     let _ = deregister_subscriber(subscriber_name);
