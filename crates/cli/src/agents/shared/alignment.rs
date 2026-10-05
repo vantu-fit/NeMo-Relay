@@ -141,8 +141,11 @@ impl ProviderRequestExtractor for OpenAiResponsesRequestExtractor {
         affinity_key_from_task_text(responses_user_task_text(&request.content)?)
     }
 
-    fn gateway_turn_input(&self, _agent_kind: AgentKind, _request: &LlmRequest) -> Option<Value> {
-        None
+    fn gateway_turn_input(&self, agent_kind: AgentKind, request: &LlmRequest) -> Option<Value> {
+        if agent_kind != AgentKind::Codex {
+            return None;
+        }
+        responses_turn_prompt(&request.content).map(|prompt| json!({ "prompt": prompt }))
     }
 }
 
@@ -765,6 +768,38 @@ fn responses_user_task_text(payload: &Value) -> Option<String> {
         .get("input")
         .and_then(responses_input_task_text)
         .or_else(|| payload.get("prompt").and_then(prompt_task_text))
+}
+
+// A gateway-only Codex turn has no prompt hook. Seed its root from the latest
+// user message, not instructions, history, request headers, or tool results. Unlike
+// affinity matching, valid JSON text and all text blocks are meaningful input.
+fn responses_turn_prompt(payload: &Value) -> Option<String> {
+    let input = payload.get("input")?;
+    let content = match input {
+        Value::String(_) => input,
+        Value::Array(items) => items
+            .iter()
+            .rev()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))?
+            .get("content")?,
+        _ => return None,
+    };
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("input_text" | "text")
+                )
+            })
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.trim().is_empty()).then_some(text)
 }
 
 fn affinity_key_from_task_text(task_text: String) -> Option<String> {
